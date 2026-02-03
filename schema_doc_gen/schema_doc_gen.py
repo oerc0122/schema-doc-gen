@@ -6,6 +6,7 @@ import argparse
 import json
 import pkgutil
 import sys
+from collections import defaultdict
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
@@ -143,7 +144,6 @@ def get_arg_parser() -> argparse.ArgumentParser:
         action="append",
         help="Temporary additions to system path for finding relative location",
         type=Path,
-        default=(Path.cwd(),),
     )
 
     parser.add_argument(
@@ -156,7 +156,6 @@ def get_arg_parser() -> argparse.ArgumentParser:
             "components to be written consecutively to the same file. "
             "(default: %(default)r)"
         ),
-        default=["all"],
     )
 
     parser.add_argument(
@@ -222,6 +221,8 @@ def process_schema(
     ------
     ValueError
         Name not passed with Schema.
+    KeyError
+        Schema not in dict or invalid type.
     """
     match (schema_key, name):
         case (_, str() as inp):
@@ -243,7 +244,7 @@ def process_schema(
         case str():
             json_schema = json.loads(schema)
         case _:
-            raise KeyError("Schema not found")
+            raise KeyError(f"Schema ({schema_key}) not found or invalid type ({schema!r})")
 
     return jsonschema_markdown.generate(
         json_schema,
@@ -279,7 +280,7 @@ def get_filename(fmt: str, key: str) -> str:
 def build_schema_set(
     schema_dict: dict[str, Schema],
     schema_keys: Sequence[str],
-) -> dict[str, Sequence[str]]:
+) -> tuple[dict[str, Sequence[str]], set[str]]:
     """Build the full schema set.
 
     Parameters
@@ -294,20 +295,55 @@ def build_schema_set(
     schema_set : dict[str, Sequence[str]]
         Dict mapping output name to set of schema to include in that file.
     """
-    schema_set = {
-        name: schemas if schemas != ["all"] else list(schema_dict.keys())
-        for block in schema_keys
-        if ":" in block
-        for name, *schemas in block.split(":")
-    }
-    schema_set.update(
-        {schema: [schema] for schema in schema_keys if ":" not in schema and schema != "all"},
-    )
+    # Get all schemas as groups
+    schema_set = {}
+    for key in schema_keys:
+        match key.split(":"):
+            case ["all"]:
+                for schema in schema_dict:
+                    schema_set[schema] = [schema]
+            case [name]:
+                schema_set[name] = [name]
+            case [name, *_] if ":all" in key:
+                schema_set[name] = list(schema_dict)
+            case [name, *schemas]:
+                schema_set[name] = schemas
 
-    if "all" in schema_keys:
-        schema_set.update({schema: [schema] for schema in schema_dict})
+    # Dedup schema_set
+    # Get unique (by schema), but ordered keys matching reqs
+    indiv_schemas = {schema for schemas in schema_set.values() for schema in schemas}
+    schemas_rev = defaultdict(list)
+    for key, schema in reversed(schema_dict.items()):
+        if key in indiv_schemas:
+            schemas_rev[schema].append(key)
 
-    return schema_set
+    def get_main_key(key: str) -> str:
+        """Find main key excluding aliases.
+
+        Parameters
+        ----------
+        key : str
+            Key to find.
+
+        Returns
+        -------
+        str
+            Main unaliased key to grab.
+
+        Raises
+        ------
+        KeyError
+            Key unavailable.
+        """
+        for avail in schemas_rev.values():
+            if key in avail:
+                return avail[0]
+
+        raise KeyError(f"{key} not found in schemas")
+
+    return {
+        name: list(dict.fromkeys(map(get_main_key, keys))) for name, keys in schema_set.items()
+    }, indiv_schemas
 
 
 def main(
@@ -347,21 +383,13 @@ def main(
     title : str
         Title of rst page.
     """
-    schema_set = build_schema_set(schemas, schema_keys)
+    schema_set, requested_schema = build_schema_set(schemas, schema_keys)
 
-    indiv_schemas = {schema for schemas in schema_set.values() for schema in schemas}
-
-    # Get unique (by schema), but ordered keys matching reqs
-    schemas = {
-        schema: key
-        for key, schema in reversed(schemas.items())
-        if "all" in schema_keys or key in indiv_schemas
-    }
     out_names = [get_filename(out_name_fmt, name) for name in schema_set]
     out_folder = Path(out_folder)
 
     if verbose:
-        print(f"Generating schemas for keys {', '.join(map(repr, schemas.values()))}...")
+        print(f"Generating schemas for keys {', '.join(map(repr, requested_schema))}...")
 
     if clean:
         clear_folder(out_folder, force=force_clear, verbose=verbose)
@@ -414,7 +442,7 @@ def cli(args_in: Sequence[str] | None = None, /) -> None:
 
     main(
         schemas=schemas,
-        schema_keys=args.schemas,
+        schema_keys=args.schemas or ("all",),
         out_name_fmt=args.out_name,
         out_folder=args.out_folder,
         verbose=args.verbose,
